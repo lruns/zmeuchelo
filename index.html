@@ -71,6 +71,11 @@
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     BASE = Math.min(W, H);
     S = BASE / 900;
+    // На узких экранах (телефон) увеличиваем масштаб мира: змейка, мужики, ёлка,
+    // яблоки, таблички, пузыри и шрифты — крупнее и читаемее пальцем. Поле
+    // логически становится теснее (меньше влезает) — так задумано.
+    var WZ = (W < 500) ? 1.8 : (W < 720 ? 1.3 : 1);
+    S *= WZ;
     layout();
   }
 
@@ -270,6 +275,9 @@
       target: null,                      // яблоко-цель при поиске
       touchCd: 0,                        // антидребезг касания змейкой
       ctxCd: 0,                          // кулдаун контекстных реплик
+      puffs: [],                         // дымки-пыхтелки при переносе яблока
+      puffT: 0,
+      fixAnim: 0,                        // таймер сценки «фикса»
       bubble: null,                      // {text, t}
       bubbleT: 3 + Math.random() * 5
     };
@@ -528,7 +536,7 @@
       fixerTimer -= dt;
       if (fixerTimer <= 0) {
         var pool = [];
-        for (var q = 0; q < npcs.length; q++) if (npcs[q].mode !== "fixer") pool.push(npcs[q]);
+        for (var q = 0; q < npcs.length; q++) if (npcs[q].mode !== "fixer" && npcs[q].mode !== "fixing") pool.push(npcs[q]);
         if (pool.length) {
           var pk = pool[(Math.random() * pool.length) | 0];
           if (pk.carry) { pk.carry.x = pk.x; pk.carry.y = pk.y; foods.push(pk.carry); pk.carry = null; }
@@ -546,7 +554,17 @@
       if (STATE === "play") {
         if (m.mode === "fixer") {
           moveToward(m, snake.x, snake.y, dt);
-          if (m.touchCd <= 0 && dist(m.x, m.y, snake.x, snake.y) < npcR() + headR()) {
+          if (dist(m.x, m.y, snake.x, snake.y) < npcR() + headR()) {
+            m.mode = "fixing"; m.fixAnim = 0.85; m.target = null;   // запускаем сценку «фикса»
+            sfx.bul();
+          }
+        } else if (m.mode === "fixing") {
+          // ~0.85с: мужик прилипает к голове змейки и суетится (машет руками, стук-стук)
+          m.fixAnim -= dt;
+          var sd = (m.x <= snake.x) ? -1 : 1;
+          m.x = snake.x + sd * npcR() * 0.85;    // держится вплотную сбоку от головы
+          m.y = snake.y - 6 * S;
+          if (m.fixAnim <= 0) {
             floatMsg = { text: "ПОФИКШЕНО", t: 1.7 };
             snake.fixT = 5;
             snake.fixSeg = 3 + ((Math.random() * Math.max(1, snake.seg - 3)) | 0);
@@ -584,7 +602,7 @@
         if (m.ctxCd > 0) m.ctxCd -= dt;
         if (m.ctxCd <= 0 && dist(m.x, m.y, snake.x, snake.y) < 190 * S) {
           var cl;
-          if (m.mode === "fixer") {
+          if (m.mode === "fixer" || m.mode === "fixing") {
             cl = "моя прелесть, дай тебя догоню, змеючело";
           } else {
             var nearApple = !!m.carry;
@@ -596,6 +614,13 @@
           m.ctxCd = 4.5;
         }
       }
+
+      // дымки-пыхтелки: пока несёт — подкидываем новые; обновляем всегда (дотаивают)
+      if (m.mode === "carry") {
+        m.puffT -= dt;
+        if (m.puffT <= 0) { m.puffs.push({ x: m.x + (Math.random() - 0.5) * 24 * S, y: m.y - 30 * S, t: 0, life: 0.7 + Math.random() * 0.4 }); m.puffT = 0.3; }
+      }
+      for (var pp = m.puffs.length - 1; pp >= 0; pp--) { var P = m.puffs[pp]; P.t += dt; P.y -= 22 * S * dt; if (P.t >= P.life) m.puffs.splice(pp, 1); }
 
       m.bubbleT -= dt;
       if (m.bubble) { m.bubble.t -= dt; if (m.bubble.t <= 0) m.bubble = null; }
@@ -690,33 +715,65 @@
     ell(pond.cx, pond.cy, pond.rx, pond.ry, "#1E3A8A");
   }
 
+  // Звёздочка из чёрточек (для сценки «фикса»), без глифов
+  function starMark(x, y, r) {
+    stroke(x - r, y, x + r, y);
+    stroke(x, y - r, x, y + r);
+    stroke(x - r * 0.7, y - r * 0.7, x + r * 0.7, y + r * 0.7);
+    stroke(x - r * 0.7, y + r * 0.7, x + r * 0.7, y - r * 0.7);
+  }
+
   function drawNpc(m) {
     // тела/цвета
     var headFill = m.kind === "yellow" ? "#F4D63A" : "#4B7BEC";
     var bellyFill = m.kind === "yellow" ? "#8A7A2B" : "#3A63C8";
+    if (m.carry) bellyFill = "#C0512B";                       // пузо краснеет от натуги
     var limbFill = headFill;
     var hr = 26 * S, bw = 70 * S, bh = 60 * S;
-    // руки (прямоугольники) — налезают на пузо
-    rect(m.x - bw * 0.7, m.y + hr * 0.4, bw * 0.5, 16 * S, limbFill);
-    rect(m.x + bw * 0.2, m.y + hr * 0.4, bw * 0.5, 16 * S, limbFill);
+    var bob = m.carry ? Math.sin(animT * 9 + m.y) * 3 * S : 0; // «спешит» — покачивание
+    var mx = m.x + bob;
+    // дымки-пыхтелки над несущим (серые тающие эллипсы) — видно издалека
+    for (var pu = 0; pu < m.puffs.length; pu++) {
+      var pf = m.puffs[pu];
+      ctx.globalAlpha = Math.max(0, 1 - pf.t / pf.life) * 0.7;
+      ell(pf.x, pf.y, (5 + pf.t * 10) * S, (4 + pf.t * 8) * S, "#BFC3C7");
+      ctx.globalAlpha = 1;
+    }
+    // руки; при «фиксе» — машут вверх-вниз
+    var wave = (m.mode === "fixing") ? Math.sin(animT * 20) * 12 * S : 0;
+    rect(mx - bw * 0.7, m.y + hr * 0.4 - wave, bw * 0.5, 16 * S, limbFill);
+    rect(mx + bw * 0.2, m.y + hr * 0.4 + wave, bw * 0.5, 16 * S, limbFill);
     // ноги
-    rect(m.x - 22 * S, m.y + hr + bh * 0.4, 18 * S, 44 * S, limbFill);
-    rect(m.x + 4 * S, m.y + hr + bh * 0.4, 18 * S, 44 * S, limbFill);
+    rect(mx - 22 * S, m.y + hr + bh * 0.4, 18 * S, 44 * S, limbFill);
+    rect(mx + 4 * S, m.y + hr + bh * 0.4, 18 * S, 44 * S, limbFill);
     // пузо-эллипс
-    ell(m.x, m.y + hr * 0.9, bw * 0.5, bh * 0.5, bellyFill);
+    ell(mx, m.y + hr * 0.9, bw * 0.5, bh * 0.5, bellyFill);
     // голова
-    ell(m.x, m.y - hr * 0.2, hr, hr, headFill);
+    ell(mx, m.y - hr * 0.2, hr, hr, headFill);
     // лицо (смотрит на нас)
-    ell(m.x - hr * 0.42, m.y - hr * 0.3, hr * 0.30, hr * 0.40, "#fff");
-    ell(m.x + hr * 0.42, m.y - hr * 0.3, hr * 0.30, hr * 0.40, "#fff");
-    ell(m.x, m.y + hr * 0.15, hr * 0.34, hr * 0.20, "#E33");
+    ell(mx - hr * 0.42, m.y - hr * 0.3, hr * 0.30, hr * 0.40, "#fff");
+    ell(mx + hr * 0.42, m.y - hr * 0.3, hr * 0.30, hr * 0.40, "#fff");
+    ell(mx, m.y + hr * 0.15, hr * 0.34, hr * 0.20, "#E33");
     // унесённое яблоко «в руке» (у правой ладони)
     if (m.carry) {
-      var ax = m.x + bw * 0.72, ay = m.y + hr * 0.4 + 8 * S;
+      var ax = mx + bw * 0.72, ay = m.y + hr * 0.4 + 8 * S;
       ell(ax, ay, 13 * S, 13 * S * 0.62, "#E33");
     }
+    // сценка «фикса»: вокруг головы змейки — кольцо стук-стук штрихов и звёздочки
+    if (m.mode === "fixing" && snake) {
+      var shr = headR(), seed = Math.floor(animT * 16), n = 7;
+      for (var kk = 0; kk < n; kk++) {
+        var aa = kk * (Math.PI * 2 / n) + seed * 0.5;
+        var r0 = shr * 1.15, r1 = shr * 1.15 + (9 + (kk % 2) * 8) * S;
+        stroke(snake.x + Math.cos(aa) * r0, snake.y + Math.sin(aa) * r0,
+               snake.x + Math.cos(aa) * r1, snake.y + Math.sin(aa) * r1);
+      }
+      starMark(snake.x - shr * 1.6, snake.y - shr * 1.5, 11 * S);
+      starMark(snake.x + shr * 1.6, snake.y - shr * 1.2, 9 * S);
+      starMark(snake.x, snake.y - shr * 2.0, 8 * S);
+    }
     // пузырь реплики
-    if (m.bubble) drawBubble(m.x, m.y - hr - 12 * S, m.bubble.text);
+    if (m.bubble) drawBubble(mx, m.y - hr - 12 * S, m.bubble.text);
   }
 
   function drawBubble(px, py, text) {
@@ -801,11 +858,11 @@
   }
 
   function drawPauseButton() {
-    var w = 100 * S, h = 34 * S;
+    var w = Math.max(112, 100 * S), h = Math.max(46, 40 * S);   // тач-мишень >= 44px
     var b = { x: W - w - 12, y: 12, w: w, h: h };
     buttons.pause = b;
     rect(b.x, b.y, b.w, b.h, "#fff");
-    ctx.font = "bold " + Math.round(15 * S) + "px sans-serif";
+    ctx.font = "bold " + Math.round(Math.max(15, 15 * S)) + "px sans-serif";
     ctx.fillStyle = "#000"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText("пауза", b.x + b.w / 2, b.y + b.h / 2);
   }
@@ -821,11 +878,11 @@
   }
 
   function drawSoundButton() {
-    var w = 108 * S, h = 34 * S;
+    var w = Math.max(120, 108 * S), h = Math.max(46, 40 * S);   // тач-мишень >= 44px
     var b = { x: W - w - 12, y: 12, w: w, h: h };
     buttons.sound = b;
     rect(b.x, b.y, b.w, b.h, "#fff");
-    ctx.font = Math.round(15 * S) + "px sans-serif";
+    ctx.font = Math.round(Math.max(15, 15 * S)) + "px sans-serif";
     ctx.fillStyle = "#000"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(soundOn ? "звук: вкл" : "звук: выкл", b.x + b.w / 2, b.y + b.h / 2);
   }
